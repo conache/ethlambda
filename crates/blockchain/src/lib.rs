@@ -116,7 +116,7 @@ impl BlockChainServer {
             error!("Head state has no validators, skipping tick");
             return;
         }
-         // Update current slot metric
+        // Update current slot metric
         metrics::update_current_slot(slot);
 
         // Determine sync status: suppress validator duties while our head is
