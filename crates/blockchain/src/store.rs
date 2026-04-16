@@ -144,6 +144,7 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     if gossip_groups.is_empty() && new_payload_keys.is_empty() {
         return Vec::new();
     }
+    let aggregation_start = std::time::Instant::now();
     let _timing = metrics::time_committee_signatures_aggregation();
 
     let mut new_aggregates: Vec<SignedAggregatedAttestation> = Vec::new();
@@ -154,10 +155,21 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     let mut keys_to_delete: Vec<(u64, H256)> = Vec::new();
     let mut payload_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
 
+    // Counters for aggregation workload tracking.
+    let mut groups_aggregated: usize = 0;
+    let mut total_raw_sigs: usize = 0;
+    let mut total_children: usize = 0;
+
     let gossip_roots: HashSet<H256> = gossip_groups
         .iter()
         .map(|(hashed, _)| hashed.root())
         .collect();
+
+    let groups_considered = gossip_groups.len()
+        + new_payload_keys
+            .iter()
+            .filter(|(root, _)| !gossip_roots.contains(root))
+            .count();
 
     // --- Pass 1: attestation data with gossip signatures ---
     //
@@ -193,6 +205,13 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             continue;
         }
 
+        let group_raw_sigs = raw_ids.len();
+        let group_children = child_proofs.len();
+        groups_aggregated += 1;
+        total_raw_sigs += group_raw_sigs;
+        total_children += group_children;
+
+        let group_start = std::time::Instant::now();
         let Some((proof, all_ids)) = try_aggregate(
             &child_proofs,
             pubkeys,
@@ -202,8 +221,26 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             slot,
             &head_state,
         ) else {
+            let group_elapsed = group_start.elapsed();
+            trace!(
+                %slot,
+                raw_sigs = group_raw_sigs,
+                children = group_children,
+                ?group_elapsed,
+                "Aggregation group failed (gossip)"
+            );
             continue;
         };
+
+        let group_elapsed = group_start.elapsed();
+        trace!(
+            %slot,
+            raw_sigs = group_raw_sigs,
+            children = group_children,
+            participants = all_ids.len(),
+            ?group_elapsed,
+            "Aggregation group (gossip)"
+        );
 
         new_aggregates.push(SignedAggregatedAttestation {
             data: hashed.data().clone(),
@@ -241,6 +278,11 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             continue;
         }
 
+        let group_children = child_proofs.len();
+        groups_aggregated += 1;
+        total_children += group_children;
+
+        let group_start = std::time::Instant::now();
         let Some((proof, all_ids)) = try_aggregate(
             &child_proofs,
             vec![],
@@ -250,8 +292,26 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             att_data.slot,
             &head_state,
         ) else {
+            let group_elapsed = group_start.elapsed();
+            trace!(
+                slot = att_data.slot,
+                raw_sigs = 0,
+                children = group_children,
+                ?group_elapsed,
+                "Aggregation group failed (payload)"
+            );
             continue;
         };
+
+        let group_elapsed = group_start.elapsed();
+        trace!(
+            slot = att_data.slot,
+            raw_sigs = 0,
+            children = group_children,
+            participants = all_ids.len(),
+            ?group_elapsed,
+            "Aggregation group (payload)"
+        );
 
         let hashed = HashedAttestationData::new(att_data.clone());
         new_aggregates.push(SignedAggregatedAttestation {
@@ -272,6 +332,17 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     // Delete consumed/redundant gossip signatures
     store.delete_gossip_signatures(&keys_to_delete);
     metrics::update_gossip_signatures(store.gossip_signatures_count());
+
+    let aggregation_elapsed = aggregation_start.elapsed();
+    info!(
+        ?aggregation_elapsed,
+        groups_considered,
+        groups_aggregated,
+        aggregates_produced = new_aggregates.len(),
+        total_raw_sigs,
+        total_children,
+        "Committee signatures aggregated"
+    );
 
     new_aggregates
 }
@@ -1249,8 +1320,18 @@ fn compact_attestations(
             .collect::<Result<Vec<_>, StoreError>>()?;
 
         let slot: u32 = data.slot.try_into().expect("slot exceeds u32");
+        let num_children = children.len();
+        let compact_group_start = std::time::Instant::now();
         let merged_proof_data = aggregate_proofs(children, &data_root, slot)
             .map_err(StoreError::SignatureAggregationFailed)?;
+        let compact_group_elapsed = compact_group_start.elapsed();
+
+        trace!(
+            slot = data.slot,
+            children = num_children,
+            ?compact_group_elapsed,
+            "Compact attestation group"
+        );
 
         let merged_proof = AggregatedSignatureProof::new(merged_bits.clone(), merged_proof_data);
         let merged_att = AggregatedAttestation {
@@ -1424,7 +1505,10 @@ fn build_block(
 
     // Compact: merge proofs sharing the same AttestationData via recursive
     // aggregation so each AttestationData appears at most once (leanSpec #510).
+    let compact_start = std::time::Instant::now();
+    let entries_before_compact = selected.len();
     let compacted = compact_attestations(selected, head_state)?;
+    let compact_elapsed = compact_start.elapsed();
 
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
@@ -1449,6 +1533,15 @@ fn build_block(
         justified: post_state.latest_justified,
         finalized: post_state.latest_finalized,
     };
+
+    info!(
+        %slot,
+        proposer_index,
+        attestation_data_entries = aggregated_signatures.len(),
+        proofs_before_compact = entries_before_compact,
+        ?compact_elapsed,
+        "Block built"
+    );
 
     Ok((final_block, aggregated_signatures, post_checkpoints))
 }
