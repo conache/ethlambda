@@ -1,4 +1,4 @@
-use super::common::{AggregationBits, Block, Container, TestInfo, TestState};
+use super::common::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
 use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::block::{
     AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
@@ -111,23 +111,3 @@ pub struct ProofData {
     pub data: String,
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-pub fn deser_xmss_hex<'de, D>(d: D) -> Result<XmssSignature, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let value = String::deserialize(d)?;
-    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
-        .map_err(|_| D::Error::custom("XmssSignature value is not valid hex"))?;
-    XmssSignature::try_from(bytes).map_err(|_| {
-        D::Error::custom(format!(
-            "XmssSignature length != {}",
-            ethlambda_types::signature::SIGNATURE_SIZE
-        ))
-    })
-}
