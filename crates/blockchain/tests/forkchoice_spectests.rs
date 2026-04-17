@@ -4,10 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{AttestationData, XmssSignature},
+    attestation::{AttestationData, SignedAggregatedAttestation, XmssSignature},
     block::{AggregatedSignatureProof, Block, BlockSignatures, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
     signature::SIGNATURE_SIZE,
@@ -82,7 +82,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time_ms, true, false);
-                    let result = store::on_block_without_verification(&mut store, signed_block);
+                    let result = store::on_block_core(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
                         (true, false) => {
@@ -104,9 +104,18 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "tick" => {
-                    let timestamp_ms = step.time.expect("tick step missing time") * 1000;
-                    // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp_ms, false, false);
+                    // Fixtures use either `time` (UNIX seconds) or `interval`
+                    // (absolute interval count since genesis). Interval fixtures
+                    // encode `genesis_time_ms + interval * MILLISECONDS_PER_INTERVAL`.
+                    let timestamp_ms = match (step.time, step.interval) {
+                        (Some(time_s), _) => time_s * 1000,
+                        (None, Some(interval)) => {
+                            genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
+                        }
+                        (None, None) => panic!("tick step missing both time and interval"),
+                    };
+                    let has_proposal = step.has_proposal.unwrap_or(false);
+                    store::on_tick(&mut store, timestamp_ms, has_proposal, false);
                 }
                 "attestation" => {
                     let att_data = step
@@ -144,24 +153,27 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "gossipAggregatedAttestation" => {
-                    // Aggregated attestation fixtures carry only attestation data
-                    // (no aggregated proof or participant list), so we use the same
-                    // non-verification path. This inserts directly into known payloads,
-                    // bypassing the new→known promotion pipeline that the production
-                    // `on_gossip_aggregated_attestation` uses.
-                    // TODO: route through a proper aggregated path once fixtures
-                    // include proof data and the test runner simulates promotion.
+                    // Route through the aggregated attestation core so the
+                    // proof's participants bitfield drives which validators are
+                    // recorded in the `new` payload buffer. This mirrors the
+                    // production pipeline without XMSS signature verification.
                     let att_data = step
                         .attestation
                         .expect("gossipAggregatedAttestation step missing attestation data");
                     let domain_data: ethlambda_types::attestation::AttestationData =
                         att_data.data.into();
-                    let validator_id = att_data.validator_id.unwrap_or(0);
+                    let proof_data = att_data
+                        .proof
+                        .expect("gossipAggregatedAttestation step missing proof");
+                    let participants = proof_data.participants.into();
+                    let aggregated = SignedAggregatedAttestation {
+                        data: domain_data,
+                        proof: AggregatedSignatureProof::empty(participants),
+                    };
 
-                    let result = store::on_gossip_attestation_without_verification(
+                    let result = store::on_gossip_aggregated_attestation_core(
                         &mut store,
-                        validator_id,
-                        domain_data,
+                        aggregated,
                     );
 
                     match (result.is_ok(), step.valid) {
@@ -226,9 +238,17 @@ fn validate_checks(
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
-    // Error on unsupported check fields
-    if checks.time.is_some() {
-        return Err(format!("Step {}: 'time' check not supported", step_idx).into());
+    // Validate time check: fixtures encode the expected store time in intervals
+    // since genesis (matching `Store::time()`).
+    if let Some(expected_time) = checks.time {
+        let actual_time = st.time();
+        if actual_time != expected_time {
+            return Err(format!(
+                "Step {}: time mismatch: expected {}, got {}",
+                step_idx, expected_time, actual_time
+            )
+            .into());
+        }
     }
     // Resolve headRootLabel to headRoot if only the label is provided
     let resolved_head_root = checks.head_root.or_else(|| {

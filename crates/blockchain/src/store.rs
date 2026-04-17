@@ -602,16 +602,14 @@ pub fn on_gossip_attestation(
 /// Process a gossiped aggregated attestation from the aggregation subnet.
 ///
 /// Aggregated attestations arrive from committee aggregators and contain a proof
-/// covering multiple validators. We store one aggregated payload entry per
-/// participating validator so the fork choice extraction works uniformly.
+/// covering multiple validators. After verifying the aggregated signature, the
+/// proof is routed through [`on_gossip_aggregated_attestation_core`] so the
+/// pending→known promotion pipeline stays in a single place.
 pub fn on_gossip_aggregated_attestation(
     store: &mut Store,
     aggregated: SignedAggregatedAttestation,
 ) -> Result<(), StoreError> {
-    validate_attestation_data(store, &aggregated.data)
-        .inspect_err(|_| metrics::inc_attestations_invalid())?;
-
-    // Verify aggregated proof signature
+    // Resolve target state and validator pubkeys needed for signature verification.
     let target_state = store
         .get_state(&aggregated.data.target.root)
         .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
@@ -632,8 +630,7 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect::<Result<_, _>>()?;
 
-    let hashed = HashedAttestationData::new(aggregated.data.clone());
-    let data_root = hashed.root();
+    let data_root = aggregated.data.hash_tree_root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     {
@@ -647,21 +644,23 @@ pub fn on_gossip_aggregated_attestation(
     }
     .map_err(StoreError::AggregateVerificationFailed)?;
 
-    // Store one proof per attestation data (not per validator)
-    store.insert_new_aggregated_payload(hashed, aggregated.proof.clone());
     let num_participants = aggregated.proof.participants.count_ones();
-    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
-
     let slot = aggregated.data.slot;
+    let target_slot = aggregated.data.target.slot;
+    let target_root = aggregated.data.target.root;
+    let source_slot = aggregated.data.source.slot;
+
+    on_gossip_aggregated_attestation_core(store, aggregated)?;
+
+    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     info!(
         slot,
         num_participants,
-        target_slot = aggregated.data.target.slot,
-        target_root = %ShortRoot(&aggregated.data.target.root.0),
-        source_slot = aggregated.data.source.slot,
+        target_slot,
+        target_root = %ShortRoot(&target_root.0),
+        source_slot,
         "Aggregated attestation processed"
     );
-
     metrics::inc_attestations_valid(1);
 
     Ok(())
@@ -669,28 +668,38 @@ pub fn on_gossip_aggregated_attestation(
 
 /// Process a new block and update the forkchoice state (with signature verification).
 ///
-/// This is the safe default: it always verifies cryptographic signatures
-/// and stores them for future block building. Use this for all production paths.
+/// This is the safe default: it validates cryptographic signatures before
+/// delegating to [`on_block_core`] for state transition and storage. Use this
+/// for all production paths.
 pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, true)
+    let block = &signed_block.message;
+    let block_root = block.hash_tree_root();
+
+    // Skip duplicate blocks before doing the expensive signature verification.
+    if store.has_state(&block_root) {
+        return Ok(());
+    }
+
+    let parent_state =
+        store
+            .get_state(&block.parent_root)
+            .ok_or(StoreError::MissingParentState {
+                parent_root: block.parent_root,
+                slot: block.slot,
+            })?;
+
+    verify_signatures(&parent_state, &signed_block)?;
+
+    on_block_core(store, signed_block)
 }
 
-/// Process a new block without signature verification.
-///
-/// This skips all cryptographic checks and signature storage. Use only in tests
-/// where signatures are absent or irrelevant (e.g., fork choice spec tests).
-pub fn on_block_without_verification(
-    store: &mut Store,
-    signed_block: SignedBlock,
-) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, false)
-}
-
-/// Process a gossip attestation without signature verification.
+/// Process a gossip attestation bypassing the aggregation pipeline.
 ///
 /// Validates the attestation data and inserts it directly into the known
-/// attestation payloads (bypassing the gossip → aggregate → promote pipeline).
-/// Use only in tests where signatures are absent (e.g., fork choice spec tests).
+/// attestation payloads (skipping gossip_signatures → aggregate → promote).
+/// This is a test-only helper: production code always flows through
+/// [`on_gossip_attestation`] and the interval-based aggregation step. The
+/// semantics diverge from the verifying path, so it does not share a core.
 pub fn on_gossip_attestation_without_verification(
     store: &mut Store,
     validator_id: u64,
@@ -717,15 +726,43 @@ pub fn on_gossip_attestation_without_verification(
     Ok(())
 }
 
-/// Core block processing logic.
+/// Core aggregated attestation processing: validate, bounds-check, and insert
+/// into the pending aggregated payload pool.
 ///
-/// When `verify` is true, cryptographic signatures are validated and stored
-/// for future block building. When false, all signature checks are skipped.
-fn on_block_core(
+/// Signature verification is the caller's responsibility; [`on_gossip_aggregated_attestation`]
+/// wraps this with XMSS proof verification. Tests that operate without valid
+/// signatures can call this directly.
+pub fn on_gossip_aggregated_attestation_core(
     store: &mut Store,
-    signed_block: SignedBlock,
-    verify: bool,
+    aggregated: SignedAggregatedAttestation,
 ) -> Result<(), StoreError> {
+    validate_attestation_data(store, &aggregated.data)
+        .inspect_err(|_| metrics::inc_attestations_invalid())?;
+
+    let target_state = store
+        .get_state(&aggregated.data.target.root)
+        .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
+    let num_validators = target_state.validators.len() as u64;
+    if aggregated
+        .proof
+        .participant_indices()
+        .any(|vid| vid >= num_validators)
+    {
+        return Err(StoreError::InvalidValidatorIndex);
+    }
+
+    let hashed = HashedAttestationData::new(aggregated.data.clone());
+    store.insert_new_aggregated_payload(hashed, aggregated.proof);
+
+    Ok(())
+}
+
+/// Core block processing: state transition, storage, and fork choice update.
+///
+/// Signature verification is the caller's responsibility; [`on_block`] wraps
+/// this with the signature check and parent-state lookup. Tests that operate
+/// without valid signatures can call this directly.
+pub fn on_block_core(store: &mut Store, signed_block: SignedBlock) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
 
@@ -767,13 +804,6 @@ fn on_block_core(
             max: MAX_ATTESTATIONS_DATA,
         });
     }
-
-    let sig_verification_start = std::time::Instant::now();
-    if verify {
-        // Validate cryptographic signatures
-        verify_signatures(&parent_state, &signed_block)?;
-    }
-    let sig_verification = sig_verification_start.elapsed();
 
     let block = signed_block.message.clone();
 
@@ -827,7 +857,6 @@ fn on_block_core(
         %slot,
         %block_root,
         %state_root,
-        ?sig_verification,
         ?state_transition,
         ?block_total,
         "Processed new block"
@@ -2039,7 +2068,7 @@ mod tests {
             },
         };
 
-        let result = on_block_without_verification(&mut store, signed_block);
+        let result = on_block_core(&mut store, signed_block);
         assert!(
             matches!(
                 result,

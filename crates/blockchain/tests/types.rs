@@ -53,7 +53,12 @@ pub struct ForkChoiceStep {
     pub step_type: String,
     pub block: Option<BlockStepData>,
     pub attestation: Option<AttestationStepData>,
+    /// UNIX time in seconds for `tick` steps (exclusive with `interval`).
     pub time: Option<u64>,
+    /// Absolute interval count since genesis for `tick` steps (exclusive with `time`).
+    pub interval: Option<u64>,
+    #[serde(rename = "hasProposal")]
+    pub has_proposal: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +68,17 @@ pub struct AttestationStepData {
     pub data: common::AttestationData,
     #[allow(dead_code)]
     pub signature: Option<String>,
+    /// Present on `gossipAggregatedAttestation` steps; carries the participants
+    /// bitfield (and proof bytes we skip in tests).
+    pub proof: Option<ProofStepData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProofStepData {
+    pub participants: common::AggregationBits,
+    #[allow(dead_code)]
+    #[serde(rename = "proofData")]
+    pub proof_data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,8 +124,10 @@ pub struct StoreChecks {
     #[serde(rename = "attestationTargetSlot")]
     pub attestation_target_slot: Option<u64>,
 
-    // Unsupported fields (will error if present in test fixture)
+    /// Expected store time in intervals since genesis (validated when present).
     pub time: Option<u64>,
+
+    // Unsupported fields (will error if present in test fixture)
     #[serde(rename = "headRootLabel")]
     pub head_root_label: Option<String>,
     #[serde(rename = "latestJustifiedSlot")]
